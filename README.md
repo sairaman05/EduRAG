@@ -4,24 +4,6 @@
 
 ---
 
-## Table of Contents
-
-1. [Research Objective](#1-research-objective)
-2. [System Architecture Overview](#2-system-architecture-overview)
-3. [Project Structure](#3-project-structure)
-4. [Detailed Pipeline Flow](#4-detailed-pipeline-flow)
-5. [What We Built (Our Contribution)](#5-what-we-built-our-contribution)
-6. [Shared Contract — config.py and interfaces.py](#6-shared-contract--configpy-and-interfacespy)
-7. [How to Run](#7-how-to-run)
-8. [Streamlit UI — Four Modes](#8-streamlit-ui--four-modes)
-9. [Teammate Integration Guide](#9-teammate-integration-guide)
-10. [Ablation Study Design](#10-ablation-study-design)
-11. [Evaluation Metrics](#11-evaluation-metrics)
-12. [Technical Details](#12-technical-details)
-13. [Dependencies](#13-dependencies)
-
----
-
 ## 1. Research Objective
 
 We aim to build a **modular RAG pipeline** for educational question-answering that:
