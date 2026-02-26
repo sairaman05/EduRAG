@@ -1,14 +1,11 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════
- Education RAG System — Streamlit UI
+ EduRAG — Streamlit UI
 ═══════════════════════════════════════════════════════════════════════════════
- Features:
-   1. Upload & index educational documents (PDF, TXT, CSV)
-   2. Query with Vanilla RAG or Hallucination-Free RAG
-   3. Side-by-side comparison mode
-   4. Detailed metrics dashboard
-   5. Ablation study runner
-   6. Export results for research
+ Three tabs:
+   1. Ask — Query your documents with any RAG variant
+   2. Compare — Side-by-side Vanilla vs Full System
+   3. Ablation — Run your questions through selected variants, see metrics
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -19,16 +16,15 @@ import time
 import json
 import os
 import sys
+import io
 import logging
-from typing import List, Dict, Optional
+import traceback
 
-# ── Setup path ──
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import RAGConfig, Document, RAGResponse, ABLATION_VARIANTS
 from pipeline import RAGPipeline
-from modules.hallucination_detector import HallucinationDetector
-from utils.metrics import MetricsLogger
+from utils.metrics import MetricsLogger, QueryLog
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,807 +32,722 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Page Config
 # ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="EduRAG — Education-Focused RAG System",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="EduRAG", page_icon="📚", layout="wide")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Custom Styling
-# ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* Main theme */
-    .stApp { background-color: #0e1117; }
-
-    /* Metric cards */
-    .metric-card {
-        background: linear-gradient(135deg, #1a1f2e 0%, #0f1318 100%);
-        border: 1px solid #2d3748;
-        border-radius: 12px;
-        padding: 20px;
-        margin: 8px 0;
-        transition: transform 0.2s;
+    .metric-box {
+        background: #1a1f2e; border: 1px solid #2d3748; border-radius: 10px;
+        padding: 16px; margin: 6px 0;
     }
-    .metric-card:hover { transform: translateY(-2px); border-color: #4a9eff; }
-    .metric-card h3 { color: #8b9dc3; font-size: 0.85rem; margin-bottom: 4px; }
-    .metric-card .value { color: #e2e8f0; font-size: 1.8rem; font-weight: 700; }
-    .metric-card .subtext { color: #64748b; font-size: 0.75rem; }
-
-    /* Claim cards */
-    .claim-supported {
-        background: #0a2e1a; border-left: 4px solid #22c55e;
-        padding: 12px 16px; border-radius: 8px; margin: 8px 0;
-    }
-    .claim-unsupported {
-        background: #2e0a0a; border-left: 4px solid #ef4444;
-        padding: 12px 16px; border-radius: 8px; margin: 8px 0;
-    }
-    .claim-score { font-size: 0.8rem; color: #94a3b8; }
-
-    /* Answer box */
-    .answer-box {
-        background: #1a1f2e; border: 1px solid #2d3748;
-        border-radius: 12px; padding: 20px; margin: 12px 0;
-        line-height: 1.7;
-    }
-
-    /* Section headers */
-    .section-header {
-        background: linear-gradient(90deg, #4a9eff22, transparent);
-        border-left: 3px solid #4a9eff;
-        padding: 8px 16px; margin: 16px 0 12px 0;
-        border-radius: 0 8px 8px 0;
-        font-weight: 600; color: #e2e8f0;
-    }
-
-    /* Hide streamlit elements */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-
-    /* Comparison mode */
-    .vs-badge {
-        background: #4a9eff; color: white; padding: 4px 12px;
-        border-radius: 20px; font-size: 0.75rem; font-weight: 700;
-    }
+    .metric-box h4 { color: #8b9dc3; font-size: 0.8rem; margin: 0; }
+    .metric-box .val { color: #e2e8f0; font-size: 1.5rem; font-weight: 700; }
+    .supported { background: #0a2e1a; border-left: 4px solid #22c55e;
+        padding: 10px 14px; border-radius: 6px; margin: 6px 0; }
+    .unsupported { background: #2e0a0a; border-left: 4px solid #ef4444;
+        padding: 10px 14px; border-radius: 6px; margin: 6px 0; }
+    .answer-box { background: #1a1f2e; border: 1px solid #2d3748;
+        border-radius: 10px; padding: 18px; margin: 10px 0; line-height: 1.7; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Session State Initialization
+# Session State
 # ─────────────────────────────────────────────────────────────────────────────
-def init_session_state():
-    defaults = {
-        "documents": [],
-        "pipelines": {},
-        "metrics_logger": MetricsLogger("edu_rag_ablation"),
-        "query_history": [],
-        "indexed": False,
-        "sample_loaded": False,
-    }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
-
-init_session_state()
+if "documents" not in st.session_state:
+    st.session_state.documents = []
+if "metrics_logger" not in st.session_state:
+    st.session_state.metrics_logger = MetricsLogger("edu_rag")
+if "parse_errors" not in st.session_state:
+    st.session_state.parse_errors = []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper Functions
+# Document Parsing
 # ─────────────────────────────────────────────────────────────────────────────
-def load_sample_documents() -> List[Document]:
-    """Load built-in sample educational documents for demo."""
-    samples = [
-        Document(
-            doc_id="bio_001",
-            content="Photosynthesis is the process by which green plants and some other organisms use sunlight to synthesize nutrients from carbon dioxide and water. Photosynthesis in plants generally involves the green pigment chlorophyll and generates oxygen as a by-product. The process primarily takes place in the leaves of plants.",
-            metadata={"source": "Biology Textbook Ch.5", "subject": "Biology", "topic": "Photosynthesis"},
-        ),
-        Document(
-            doc_id="bio_002",
-            content="The light-dependent reactions of photosynthesis occur in the thylakoid membranes. These reactions use light energy to produce ATP and NADPH, which are then used in the Calvin cycle. Water molecules are split during this process, releasing oxygen as a byproduct through photolysis.",
-            metadata={"source": "Biology Textbook Ch.5", "subject": "Biology", "topic": "Light Reactions"},
-        ),
-        Document(
-            doc_id="bio_003",
-            content="The Calvin cycle, also known as the light-independent reactions, takes place in the stroma of chloroplasts. During this cycle, carbon dioxide is fixed into organic molecules using the ATP and NADPH produced during the light-dependent reactions. The enzyme RuBisCO catalyzes the first step of carbon fixation.",
-            metadata={"source": "Biology Textbook Ch.5", "subject": "Biology", "topic": "Calvin Cycle"},
-        ),
-        Document(
-            doc_id="phy_001",
-            content="Newton's First Law of Motion states that an object at rest stays at rest, and an object in motion stays in motion with the same speed and direction, unless acted upon by an unbalanced force. This is also known as the Law of Inertia. Inertia is the tendency of an object to resist changes in its state of motion.",
-            metadata={"source": "Physics Textbook Ch.3", "subject": "Physics", "topic": "Newton's Laws"},
-        ),
-        Document(
-            doc_id="phy_002",
-            content="Newton's Second Law of Motion states that the acceleration of an object is directly proportional to the net force acting on it and inversely proportional to its mass. This is expressed mathematically as F = ma, where F is force, m is mass, and a is acceleration. This law quantifies the relationship between force and motion.",
-            metadata={"source": "Physics Textbook Ch.3", "subject": "Physics", "topic": "Newton's Laws"},
-        ),
-        Document(
-            doc_id="phy_003",
-            content="Newton's Third Law of Motion states that for every action, there is an equal and opposite reaction. When one body exerts a force on a second body, the second body simultaneously exerts a force equal in magnitude and opposite in direction on the first body. These force pairs are called action-reaction pairs.",
-            metadata={"source": "Physics Textbook Ch.3", "subject": "Physics", "topic": "Newton's Laws"},
-        ),
-        Document(
-            doc_id="chem_001",
-            content="The periodic table organizes elements by increasing atomic number and groups them by similar chemical properties. Elements in the same group (vertical column) have the same number of valence electrons, which determines their chemical behavior. The table has 18 groups and 7 periods.",
-            metadata={"source": "Chemistry Textbook Ch.2", "subject": "Chemistry", "topic": "Periodic Table"},
-        ),
-        Document(
-            doc_id="chem_002",
-            content="Chemical bonds form when atoms share or transfer electrons. Covalent bonds involve sharing of electron pairs between atoms, while ionic bonds result from the electrostatic attraction between positively and negatively charged ions. The type of bond depends on the electronegativity difference between the atoms involved.",
-            metadata={"source": "Chemistry Textbook Ch.4", "subject": "Chemistry", "topic": "Chemical Bonding"},
-        ),
-        Document(
-            doc_id="math_001",
-            content="The Pythagorean theorem states that in a right triangle, the square of the length of the hypotenuse equals the sum of the squares of the other two sides. This is expressed as a² + b² = c², where c is the hypotenuse. This theorem is fundamental to Euclidean geometry and has numerous practical applications.",
-            metadata={"source": "Mathematics Textbook Ch.7", "subject": "Mathematics", "topic": "Geometry"},
-        ),
-        Document(
-            doc_id="math_002",
-            content="Calculus is the mathematical study of continuous change. Differential calculus concerns instantaneous rates of change and slopes of curves, while integral calculus concerns accumulation of quantities and areas under curves. The fundamental theorem of calculus links these two branches.",
-            metadata={"source": "Mathematics Textbook Ch.12", "subject": "Mathematics", "topic": "Calculus"},
-        ),
-        Document(
-            doc_id="hist_001",
-            content="The Industrial Revolution began in Britain in the late 18th century and transformed manufacturing processes from hand production to machine manufacturing. Key innovations included the steam engine, spinning jenny, and power loom. This revolution led to urbanization, changes in labor patterns, and significant economic growth.",
-            metadata={"source": "History Textbook Ch.9", "subject": "History", "topic": "Industrial Revolution"},
-        ),
-        Document(
-            doc_id="cs_001",
-            content="Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed. Supervised learning uses labeled training data, while unsupervised learning finds hidden patterns in unlabeled data. Deep learning uses neural networks with multiple layers.",
-            metadata={"source": "CS Textbook Ch.15", "subject": "Computer Science", "topic": "Machine Learning"},
-        ),
-    ]
-    return samples
-
-
-def parse_uploaded_file(uploaded_file) -> List[Document]:
-    """Parse uploaded file into Document objects."""
+def chunk_text(text: str, filename: str, chunk_size: int = 500, overlap: int = 50) -> list:
+    """Split text into overlapping chunks and return Document objects."""
     docs = []
-    filename = uploaded_file.name
+    text = text.strip()
+    if not text:
+        return docs
 
-    if filename.endswith(".txt"):
-        content = uploaded_file.read().decode("utf-8")
-        # Split into chunks of ~500 chars
-        chunks = [content[i:i+500] for i in range(0, len(content), 450)]
-        for i, chunk in enumerate(chunks):
-            if chunk.strip():
-                docs.append(Document(
-                    doc_id=f"{filename}_{i:03d}",
-                    content=chunk.strip(),
-                    metadata={"source": filename, "chunk": i},
-                ))
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    full_text = "\n".join(paragraphs)
 
-    elif filename.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-        # Assume columns: content (required), optional: doc_id, source, subject
-        if "content" in df.columns:
-            for i, row in df.iterrows():
-                docs.append(Document(
-                    doc_id=row.get("doc_id", f"csv_{i:04d}"),
-                    content=str(row["content"]),
-                    metadata={
-                        "source": row.get("source", filename),
-                        "subject": row.get("subject", ""),
-                        "topic": row.get("topic", ""),
-                    },
-                ))
-        else:
-            st.warning("CSV must have a 'content' column.")
+    if not full_text:
+        return docs
 
-    elif filename.endswith(".json"):
-        data = json.loads(uploaded_file.read())
-        if isinstance(data, list):
-            for i, item in enumerate(data):
-                if isinstance(item, dict) and "content" in item:
-                    docs.append(Document(
-                        doc_id=item.get("doc_id", f"json_{i:04d}"),
-                        content=item["content"],
-                        metadata=item.get("metadata", {"source": filename}),
-                    ))
-
+    start = 0
+    i = 0
+    while start < len(full_text):
+        end = min(start + chunk_size, len(full_text))
+        chunk = full_text[start:end].strip()
+        if chunk:
+            docs.append(Document(
+                doc_id=f"{filename}_{i:03d}",
+                content=chunk,
+                metadata={"source": filename, "chunk": i},
+            ))
+            i += 1
+        start += chunk_size - overlap
     return docs
 
 
-def get_or_create_pipeline(variant_name: str, config: RAGConfig) -> RAGPipeline:
-    """Get cached pipeline or create new one."""
-    if variant_name not in st.session_state.pipelines:
-        pipeline = RAGPipeline(config, st.session_state.metrics_logger)
-        if st.session_state.documents:
-            pipeline.index_documents(st.session_state.documents)
-        st.session_state.pipelines[variant_name] = pipeline
-    return st.session_state.pipelines[variant_name]
+def parse_pdf(file_obj, filename: str) -> list:
+    """Parse PDF file. Tries PyPDF2 first, then PyMuPDF."""
+    # Reset file pointer
+    file_obj.seek(0)
+    raw_bytes = file_obj.read()
+
+    # ── Try PyPDF2 ──
+    try:
+        import PyPDF2
+        reader = PyPDF2.PdfReader(io.BytesIO(raw_bytes))
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text and text.strip():
+                pages.append(text.strip())
+        if pages:
+            full_text = "\n\n".join(pages)
+            logger.info(f"PyPDF2: extracted {len(pages)} pages, {len(full_text)} chars from {filename}")
+            return chunk_text(full_text, filename)
+    except ImportError:
+        logger.info("PyPDF2 not installed, trying PyMuPDF...")
+    except Exception as e:
+        logger.warning(f"PyPDF2 failed on {filename}: {e}")
+
+    # ── Try PyMuPDF (fitz) ──
+    try:
+        import fitz
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+        pages = []
+        for page in doc:
+            text = page.get_text()
+            if text and text.strip():
+                pages.append(text.strip())
+        doc.close()
+        if pages:
+            full_text = "\n\n".join(pages)
+            logger.info(f"PyMuPDF: extracted {len(pages)} pages, {len(full_text)} chars from {filename}")
+            return chunk_text(full_text, filename)
+    except ImportError:
+        logger.info("PyMuPDF not installed either")
+    except Exception as e:
+        logger.warning(f"PyMuPDF failed on {filename}: {e}")
+
+    # ── Try pdfplumber ──
+    try:
+        import pdfplumber
+        pdf = pdfplumber.open(io.BytesIO(raw_bytes))
+        pages = []
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text and text.strip():
+                pages.append(text.strip())
+        pdf.close()
+        if pages:
+            full_text = "\n\n".join(pages)
+            logger.info(f"pdfplumber: extracted {len(pages)} pages, {len(full_text)} chars from {filename}")
+            return chunk_text(full_text, filename)
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"pdfplumber failed on {filename}: {e}")
+
+    # All failed
+    return []
 
 
-def render_metric_card(label: str, value: str, subtext: str = "", delta: str = ""):
-    """Render a styled metric card."""
-    delta_html = f'<div style="color: {"#22c55e" if "+" in delta or "↑" in delta else "#ef4444"}; font-size: 0.8rem;">{delta}</div>' if delta else ""
+def parse_docx(file_obj, filename: str) -> list:
+    """Parse DOCX/DOC file."""
+    file_obj.seek(0)
+
+    try:
+        from docx import Document as DocxDocument
+        doc_file = DocxDocument(file_obj)
+        paragraphs = [p.text.strip() for p in doc_file.paragraphs if p.text.strip()]
+        if paragraphs:
+            full_text = "\n".join(paragraphs)
+            logger.info(f"python-docx: extracted {len(paragraphs)} paragraphs from {filename}")
+            return chunk_text(full_text, filename)
+    except ImportError:
+        logger.warning("python-docx not installed")
+    except Exception as e:
+        logger.warning(f"python-docx failed on {filename}: {e}")
+
+    return []
+
+
+def parse_uploaded_files(uploaded_files) -> tuple:
+    """
+    Parse all uploaded files into Document objects.
+    Returns (docs_list, errors_list).
+    """
+    docs = []
+    errors = []
+
+    for f in uploaded_files:
+        name = f.name
+        try:
+            if name.lower().endswith(".pdf"):
+                result = parse_pdf(f, name)
+                if result:
+                    docs.extend(result)
+                else:
+                    errors.append(f"❌ **{name}**: No text extracted. Install `pip install PyPDF2` or check if the PDF has selectable text (scanned PDFs need OCR).")
+
+            elif name.lower().endswith((".docx", ".doc")):
+                result = parse_docx(f, name)
+                if result:
+                    docs.extend(result)
+                else:
+                    errors.append(f"❌ **{name}**: No text extracted. Install `pip install python-docx`.")
+
+            elif name.lower().endswith(".txt"):
+                content = f.read().decode("utf-8", errors="ignore")
+                result = chunk_text(content, name)
+                docs.extend(result)
+
+            elif name.lower().endswith(".csv"):
+                f.seek(0)
+                df = pd.read_csv(f)
+                if "content" in df.columns:
+                    for i, row in df.iterrows():
+                        docs.append(Document(
+                            doc_id=row.get("doc_id", f"csv_{i:04d}"),
+                            content=str(row["content"]),
+                            metadata={
+                                "source": row.get("source", name),
+                                "subject": row.get("subject", ""),
+                                "topic": row.get("topic", ""),
+                            },
+                        ))
+                else:
+                    errors.append(f"⚠️ **{name}**: CSV must have a 'content' column. Found columns: {list(df.columns)}")
+
+            elif name.lower().endswith(".json"):
+                f.seek(0)
+                data = json.loads(f.read())
+                if isinstance(data, list):
+                    for i, item in enumerate(data):
+                        if isinstance(item, dict) and "content" in item:
+                            docs.append(Document(
+                                doc_id=item.get("doc_id", f"json_{i:04d}"),
+                                content=item["content"],
+                                metadata=item.get("metadata", {"source": name}),
+                            ))
+                else:
+                    errors.append(f"⚠️ **{name}**: JSON must be a list of objects with 'content' key.")
+
+            else:
+                errors.append(f"⚠️ **{name}**: Unsupported file type.")
+
+        except Exception as e:
+            errors.append(f"❌ **{name}**: {str(e)}")
+            logger.error(f"Error parsing {name}: {traceback.format_exc()}")
+
+    return docs, errors
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline Helper
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_cached_pipeline(_docs_hash: str, config_dict: dict):
+    """Cache pipeline to avoid re-indexing on every interaction."""
+    config = RAGConfig(**config_dict)
+    pipeline = RAGPipeline(config)
+    return pipeline
+
+
+def build_pipeline(config: RAGConfig) -> RAGPipeline:
+    """Build pipeline and index documents."""
+    pipeline = RAGPipeline(config, st.session_state.metrics_logger)
+    pipeline.index_documents(st.session_state.documents)
+    return pipeline
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Display Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def metric_card(label, value, sub=""):
     st.markdown(f"""
-    <div class="metric-card">
-        <h3>{label}</h3>
-        <div class="value">{value}</div>
-        {delta_html}
-        <div class="subtext">{subtext}</div>
+    <div class="metric-box">
+        <h4>{label}</h4>
+        <div class="val">{value}</div>
+        <div style="color:#64748b;font-size:0.7rem;">{sub}</div>
     </div>
     """, unsafe_allow_html=True)
 
 
-def render_claim_card(claim, idx: int):
-    """Render a single claim with support status."""
-    css_class = "claim-supported" if claim.is_supported else "claim-unsupported"
-    icon = "✅" if claim.is_supported else "❌"
-    score = f"{claim.support_score:.3f}" if claim.support_score is not None else "N/A"
-
-    st.markdown(f"""
-    <div class="{css_class}">
-        <strong>{icon} Claim {idx + 1}</strong>
-        <div style="margin: 6px 0; color: #e2e8f0;">{claim.text}</div>
-        <div class="claim-score">
-            Support Score: {score} | Threshold: {st.session_state.get("hall_threshold", 0.5)} |
-            Evidence: {claim.evidence_text[:100] + '...' if claim.evidence_text else 'None'}
+def show_claims(claims):
+    for i, c in enumerate(claims):
+        css = "supported" if c.is_supported else "unsupported"
+        icon = "✅" if c.is_supported else "❌"
+        score = f"{c.support_score:.3f}" if c.support_score is not None else "N/A"
+        st.markdown(f"""
+        <div class="{css}">
+            <strong>{icon} Claim {i+1}</strong> &nbsp;
+            <span style="color:#94a3b8;font-size:0.8rem;">Score: {score}</span>
+            <div style="color:#e2e8f0;margin-top:4px;">{c.text}</div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
+
+
+def show_retrieved_docs(docs):
+    for d in docs:
+        src = d.document.metadata.get("source", d.document.doc_id)
+        st.markdown(f"**{src}** — similarity: `{d.score:.4f}`")
+        st.caption(d.document.content[:300])
+        st.markdown("---")
+
+
+def show_citations(citations, documents):
+    if not citations:
+        return
+    st.markdown("**References:**")
+    shown = set()
+    for c in citations:
+        num = c.get("citation_num", 0)
+        doc_id = c.get("doc_id", "")
+        if num not in shown:
+            source = doc_id
+            for doc in documents:
+                if doc.document.doc_id == doc_id:
+                    source = doc.document.metadata.get("source", doc_id)
+                    break
+            st.markdown(f"[{num}] {source} (`{doc_id}`)")
+            shown.add(num)
+
+
+def get_sidebar_config() -> dict:
+    """Return common config kwargs from sidebar settings."""
+    return dict(
+        top_k=top_k,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        llm_temperature=temperature,
+        hallucination_threshold=hall_threshold,
+        mmr_lambda=mmr_lambda,
+    )
+
+
+def apply_sidebar_config(config: RAGConfig):
+    """Apply sidebar settings to a config object."""
+    config.top_k = top_k
+    config.llm_provider = llm_provider
+    config.llm_model = llm_model
+    config.llm_temperature = temperature
+    config.hallucination_threshold = hall_threshold
+    config.mmr_lambda = mmr_lambda
+    return config
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 📚 EduRAG System")
-    st.markdown("*Research-Grade RAG with Ablation*")
+    st.markdown("## 📚 EduRAG")
     st.markdown("---")
 
-    # ── Mode Selection ──
-    mode = st.radio(
-        "🔧 Mode",
-        ["Single Query", "Comparison Mode", "Ablation Study", "Metrics Dashboard"],
-        index=0,
-    )
-
-    st.markdown("---")
-
-    # ── Document Management ──
-    st.markdown("### 📄 Knowledge Base")
-
-    if st.button("📥 Load Sample Documents", use_container_width=True):
-        st.session_state.documents = load_sample_documents()
-        st.session_state.pipelines = {}  # Reset pipelines
-        st.session_state.indexed = False
-        st.session_state.sample_loaded = True
-        st.success(f"Loaded {len(st.session_state.documents)} sample documents")
-
-    uploaded_files = st.file_uploader(
-        "Upload documents",
-        type=["txt", "csv", "json"],
+    # ── Upload Documents ──
+    st.markdown("### 📄 Upload Documents")
+    uploaded = st.file_uploader(
+        "Upload your educational content",
+        type=["txt", "csv", "json", "pdf", "docx", "doc"],
         accept_multiple_files=True,
-        help="Upload educational content. CSV must have 'content' column.",
+        help="Supports: PDF, DOCX, TXT, CSV, JSON",
     )
 
-    if uploaded_files:
-        new_docs = []
-        for f in uploaded_files:
-            new_docs.extend(parse_uploaded_file(f))
+    if uploaded:
+        # Parse files on every upload change
+        with st.spinner("Parsing documents..."):
+            new_docs, parse_errors = parse_uploaded_files(uploaded)
+
         if new_docs:
-            st.session_state.documents.extend(new_docs)
-            st.session_state.pipelines = {}
-            st.session_state.indexed = False
-            st.success(f"Added {len(new_docs)} document chunks")
+            st.session_state.documents = new_docs
+            st.session_state.parse_errors = parse_errors
+            st.success(f"✅ Loaded **{len(new_docs)}** chunks from {len(uploaded)} file(s)")
+        else:
+            st.session_state.documents = []
+            st.session_state.parse_errors = parse_errors
 
-    # Show document count
-    num_docs = len(st.session_state.documents)
-    st.info(f"📊 {num_docs} documents in knowledge base")
-
-    if num_docs > 0:
-        with st.expander("Preview Documents"):
-            for doc in st.session_state.documents[:5]:
-                st.markdown(f"**{doc.doc_id}** ({doc.metadata.get('subject', 'N/A')})")
-                st.caption(doc.content[:150] + "...")
-
-    st.markdown("---")
-
-    # ── Configuration ──
-    st.markdown("### ⚙️ Configuration")
-
-    llm_provider = st.selectbox("LLM Provider", ["ollama", "openai", "huggingface"], index=0)
-    llm_model = st.text_input("Model Name", value="llama3")
-    top_k = st.slider("Top-K Retrieval", 1, 20, 5)
-    temperature = st.slider("LLM Temperature", 0.0, 1.0, 0.3, 0.1)
-
-    st.markdown("---")
-    st.markdown("### 🎯 Hallucination Settings")
-    hall_threshold = st.slider("Support Threshold", 0.0, 1.0, 0.5, 0.05)
-    st.session_state["hall_threshold"] = hall_threshold
-
-    st.markdown("---")
-
-    # ── Module Toggle Status ──
-    st.markdown("### 🔌 Module Status")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("✅ Dense Retrieval")
-        st.markdown("✅ LLM Generator")
-    with col2:
-        # Check if real modules are available
-        try:
-            from modules.mmr_reranker import MMRReranker
-            st.markdown("✅ MMR Module")
-        except ImportError:
-            st.markdown("⬜ MMR (stub)")
-
-        try:
-            from modules.citation_generator import CitationGenerator
-            st.markdown("✅ Citation Module")
-        except ImportError:
-            st.markdown("⬜ Citation (stub)")
-
-    st.markdown("✅ Hallucination Detector")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN CONTENT
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MODE 1: Single Query
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-if mode == "Single Query":
-    st.markdown("# 🔍 Single Query Mode")
-    st.markdown("Ask a question using either Vanilla RAG or Hallucination-Free RAG.")
-
-    if not st.session_state.documents:
-        st.warning("⚠️ Please load documents first (use sidebar).")
-        st.stop()
-
-    # ── Variant Selection ──
-    variant = st.radio(
-        "Select RAG Variant",
-        ["Vanilla RAG", "RAG + Hallucination Detection"],
-        horizontal=True,
-    )
-
-    # ── Query Input ──
-    query = st.text_input(
-        "💬 Ask a question",
-        placeholder="e.g., What is photosynthesis and how does it work?",
-    )
-
-    # ── Sample Questions ──
-    st.markdown("**Quick questions:**")
-    sample_qs = [
-        "What is photosynthesis?",
-        "Explain Newton's three laws of motion",
-        "What is machine learning?",
-        "Describe the periodic table",
-        "What was the Industrial Revolution?",
-    ]
-    cols = st.columns(len(sample_qs))
-    for i, q in enumerate(sample_qs):
-        if cols[i].button(q[:25] + "...", key=f"sq_{i}"):
-            query = q
-
-    if query:
-        # Build config based on variant
-        use_hall = variant == "RAG + Hallucination Detection"
-        config = RAGConfig(
-            use_mmr=False,
-            use_citation=False,
-            use_hallucination_detection=use_hall,
-            top_k=top_k,
-            llm_provider=llm_provider,
-            llm_model=llm_model,
-            llm_temperature=temperature,
-            hallucination_threshold=hall_threshold,
-        )
-
-        pipeline = get_or_create_pipeline(variant, config)
-
-        # Index if needed
-        if not st.session_state.indexed:
-            with st.spinner("📦 Indexing documents..."):
-                pipeline.index_documents(st.session_state.documents)
-                st.session_state.indexed = True
-
-        # Run query
-        with st.spinner(f"🔄 Running {variant}..."):
-            response = pipeline.query(query)
-
-        # ── Display Answer ──
-        st.markdown('<div class="section-header">💡 Answer</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="answer-box">{response.final_answer}</div>', unsafe_allow_html=True)
-
-        # ── Retrieved Documents ──
-        with st.expander("📄 Retrieved Documents", expanded=False):
-            for doc in response.retrieved_docs:
-                st.markdown(f"""
-                **{doc.document.doc_id}** — Score: `{doc.score:.4f}` | 
-                Subject: {doc.document.metadata.get('subject', 'N/A')} |
-                Topic: {doc.document.metadata.get('topic', 'N/A')}
-                """)
-                st.caption(doc.document.content)
-                st.markdown("---")
-
-        # ── Hallucination Analysis (if enabled) ──
-        if use_hall and response.claims:
-            st.markdown('<div class="section-header">🔬 Hallucination Analysis</div>', unsafe_allow_html=True)
-
-            detector = HallucinationDetector(config)
-            report = detector.get_detailed_report(response.claims)
-
-            # Summary metrics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                render_metric_card(
-                    "Faithfulness",
-                    f"{report['summary']['faithfulness_score']:.1%}",
-                    "Higher is better"
-                )
-            with col2:
-                render_metric_card(
-                    "Hallucination Rate",
-                    f"{report['summary']['hallucination_rate']:.1%}",
-                    "Lower is better"
-                )
-            with col3:
-                render_metric_card(
-                    "Claims Supported",
-                    f"{report['summary']['supported']}/{report['summary']['total_claims']}",
-                    "Verified claims"
-                )
-            with col4:
-                render_metric_card(
-                    "Verification Time",
-                    f"{response.module_timings.get('hallucination', 0):.0f}ms",
-                    "Processing time"
-                )
-
-            # Individual claims
-            st.markdown("**Claim-Level Analysis:**")
-            for i, claim in enumerate(response.claims):
-                render_claim_card(claim, i)
-
-            # Show raw vs filtered
-            if response.raw_answer != response.final_answer:
-                with st.expander("📝 Raw vs Filtered Answer"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("**Raw Answer (before filtering):**")
-                        st.markdown(response.raw_answer)
-                    with col2:
-                        st.markdown("**Filtered Answer (after removing hallucinations):**")
-                        st.markdown(response.final_answer)
-
-        # ── Pipeline Metrics ──
-        with st.expander("📊 Pipeline Metrics", expanded=False):
-            st.json(response.metrics)
-            st.markdown("**Module Timings:**")
-            timing_df = pd.DataFrame([response.module_timings]).T
-            timing_df.columns = ["Time (ms)"]
-            st.dataframe(timing_df)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MODE 2: Comparison Mode
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-elif mode == "Comparison Mode":
-    st.markdown("# ⚔️ Comparison Mode")
-    st.markdown("Run the same query through Vanilla RAG and Hallucination-Free RAG side-by-side.")
-
-    if not st.session_state.documents:
-        st.warning("⚠️ Please load documents first (use sidebar).")
-        st.stop()
-
-    query = st.text_input(
-        "💬 Ask a question",
-        placeholder="e.g., What is photosynthesis and how does it work?",
-    )
-
-    # Optional ground truth for evaluation
-    ground_truth = st.text_area(
-        "📋 Ground Truth Answer (optional, for metric computation)",
-        placeholder="Paste a reference answer here to compute F1, EM, ROUGE-L...",
-        height=80,
-    )
-
-    if query:
-        # ── Build two pipelines ──
-        config_vanilla = RAGConfig(
-            use_hallucination_detection=False,
-            top_k=top_k, llm_provider=llm_provider, llm_model=llm_model,
-            llm_temperature=temperature,
-        )
-        config_hallfree = RAGConfig(
-            use_hallucination_detection=True,
-            top_k=top_k, llm_provider=llm_provider, llm_model=llm_model,
-            llm_temperature=temperature, hallucination_threshold=hall_threshold,
-        )
-
-        pipe_vanilla = get_or_create_pipeline("Vanilla RAG", config_vanilla)
-        pipe_hallfree = get_or_create_pipeline("RAG + Hallucination Detection", config_hallfree)
-
-        if not st.session_state.indexed:
-            with st.spinner("📦 Indexing documents..."):
-                pipe_vanilla.index_documents(st.session_state.documents)
-                pipe_hallfree.index_documents(st.session_state.documents)
-                st.session_state.indexed = True
-
-        # ── Run both ──
-        gt = ground_truth.strip() if ground_truth.strip() else None
-        col_left, col_right = st.columns(2)
-
-        with col_left:
-            st.markdown("### 📦 Vanilla RAG")
-            with st.spinner("Running..."):
-                resp_vanilla = pipe_vanilla.query(query, ground_truth=gt)
-            st.markdown(f'<div class="answer-box">{resp_vanilla.final_answer}</div>', unsafe_allow_html=True)
-
-            # Metrics
-            st.markdown("**Metrics:**")
-            m = resp_vanilla.metrics
-            render_metric_card("Avg Similarity", f"{m.get('avg_similarity', 0):.4f}")
-            render_metric_card("Total Time", f"{resp_vanilla.module_timings.get('total', 0):.0f}ms")
-
-        with col_right:
-            st.markdown("### 🛡️ Hallucination-Free RAG")
-            with st.spinner("Running..."):
-                resp_hallfree = pipe_hallfree.query(query, ground_truth=gt)
-            st.markdown(f'<div class="answer-box">{resp_hallfree.final_answer}</div>', unsafe_allow_html=True)
-
-            # Hallucination metrics
-            st.markdown("**Metrics:**")
-            h = resp_hallfree.hallucination_stats
-            render_metric_card(
-                "Faithfulness",
-                f"{h.get('faithfulness_score', 0):.1%}",
-                f"Hallucination Rate: {h.get('hallucination_rate', 0):.1%}"
-            )
-            render_metric_card(
-                "Claims",
-                f"{h.get('num_supported', 0)}/{h.get('num_claims', 0)} supported"
-            )
-            render_metric_card("Total Time", f"{resp_hallfree.module_timings.get('total', 0):.0f}ms")
-
-        # ── Answer Quality Comparison (if ground truth provided) ──
-        if gt:
-            st.markdown("---")
-            st.markdown('<div class="section-header">📊 Answer Quality Comparison</div>', unsafe_allow_html=True)
-
-            ml = st.session_state.metrics_logger
-            aq_vanilla = ml.compute_answer_quality(resp_vanilla.final_answer, gt)
-            aq_hallfree = ml.compute_answer_quality(resp_hallfree.final_answer, gt)
-
-            comp_df = pd.DataFrame({
-                "Metric": ["F1 Score", "Exact Match", "ROUGE-L", "Token Precision", "Token Recall"],
-                "Vanilla RAG": [
-                    f"{aq_vanilla.get('f1_score', 0):.4f}",
-                    f"{aq_vanilla.get('exact_match', 0):.0f}",
-                    f"{aq_vanilla.get('rouge_l', 0):.4f}",
-                    f"{aq_vanilla.get('token_precision', 0):.4f}",
-                    f"{aq_vanilla.get('token_recall', 0):.4f}",
-                ],
-                "Hall-Free RAG": [
-                    f"{aq_hallfree.get('f1_score', 0):.4f}",
-                    f"{aq_hallfree.get('exact_match', 0):.0f}",
-                    f"{aq_hallfree.get('rouge_l', 0):.4f}",
-                    f"{aq_hallfree.get('token_precision', 0):.4f}",
-                    f"{aq_hallfree.get('token_recall', 0):.4f}",
-                ],
-            })
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
-
-        # ── Claim Detail for HallFree ──
-        if resp_hallfree.claims:
-            with st.expander("🔬 Claim-Level Analysis (Hallucination-Free RAG)"):
-                for i, claim in enumerate(resp_hallfree.claims):
-                    render_claim_card(claim, i)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MODE 3: Ablation Study
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-elif mode == "Ablation Study":
-    st.markdown("# 🧪 Ablation Study Runner")
-    st.markdown("""
-    Run systematic experiments comparing all RAG variants.
-    Results are logged for statistical analysis.
-    """)
-
-    if not st.session_state.documents:
-        st.warning("⚠️ Please load documents first (use sidebar).")
-        st.stop()
-
-    # ── Variant Selection ──
-    st.markdown("### Select Variants to Compare")
-    selected_variants = st.multiselect(
-        "Ablation variants",
-        list(ABLATION_VARIANTS.keys()),
-        default=["Vanilla RAG", "RAG + Hallucination Detection"],
-    )
-
-    # ── Query Set ──
-    st.markdown("### Query Set")
-    query_input_method = st.radio("Input method", ["Manual", "Predefined Set"], horizontal=True)
-
-    if query_input_method == "Manual":
-        queries_text = st.text_area(
-            "Enter queries (one per line)",
-            value="What is photosynthesis?\nExplain Newton's laws of motion\nWhat is machine learning?",
-            height=150,
-        )
-        queries = [q.strip() for q in queries_text.strip().split("\n") if q.strip()]
+        # Show parse errors
+        for err in parse_errors:
+            st.error(err)
     else:
-        queries = [
-            "What is photosynthesis and how does it work?",
-            "Explain Newton's three laws of motion.",
-            "What is the periodic table?",
-            "How do chemical bonds form?",
-            "What is the Pythagorean theorem?",
-            "Describe the Industrial Revolution.",
-            "What is machine learning?",
-            "What is calculus used for?",
-        ]
-        st.info(f"Using {len(queries)} predefined educational queries")
+        # File uploader cleared
+        if st.session_state.documents:
+            st.session_state.documents = []
 
-    num_runs = st.slider("Runs per query (for statistical significance)", 1, 5, 1)
+    num_docs = len(st.session_state.documents)
+    if num_docs > 0:
+        st.info(f"📊 **{num_docs}** document chunks ready")
+        with st.expander("Preview documents"):
+            for doc in st.session_state.documents[:8]:
+                st.caption(f"**{doc.doc_id}**: {doc.content[:120]}...")
+            if num_docs > 8:
+                st.caption(f"... and {num_docs - 8} more")
 
-    if st.button("🚀 Run Ablation Study", type="primary", use_container_width=True):
-        # Reset metrics logger for fresh experiment
-        st.session_state.metrics_logger = MetricsLogger("ablation_study")
+    st.markdown("---")
 
-        progress = st.progress(0)
-        status = st.empty()
-        total_steps = len(selected_variants) * len(queries) * num_runs
-        step = 0
+    # ── LLM Settings ──
+    st.markdown("### ⚙️ LLM Settings")
+    llm_provider = st.selectbox("Provider", ["ollama", "openai", "huggingface"])
+    llm_model = st.text_input("Model", value="llama3")
+    top_k = st.slider("Top-K retrieval", 1, 20, 5)
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.3, 0.05)
 
-        results_table = []
+    st.markdown("---")
+    st.markdown("### 🎯 Thresholds")
+    hall_threshold = st.slider("Hallucination threshold", 0.0, 1.0, 0.5, 0.05)
+    mmr_lambda = st.slider("MMR lambda", 0.0, 1.0, 0.7, 0.05,
+                           help="Higher = more relevance, Lower = more diversity")
 
-        for variant_name in selected_variants:
-            config = ABLATION_VARIANTS[variant_name]
-            # Override with sidebar settings
-            config.top_k = top_k
-            config.llm_provider = llm_provider
-            config.llm_model = llm_model
-            config.llm_temperature = temperature
-            config.hallucination_threshold = hall_threshold
 
-            pipeline = RAGPipeline(config, st.session_state.metrics_logger)
-            pipeline.index_documents(st.session_state.documents)
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN CONTENT — Title + Tabs (always visible)
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("# 📚 EduRAG — Education RAG System")
 
-            for query in queries:
-                for run in range(num_runs):
-                    step += 1
-                    progress.progress(step / total_steps)
-                    status.text(f"Running: {variant_name} | Query: {query[:40]}... | Run {run+1}/{num_runs}")
+# Always show tabs — show a message inside each tab if no documents
+has_docs = len(st.session_state.documents) > 0
 
+tab_ask, tab_compare, tab_ablation = st.tabs(["🔍 Ask", "⚔️ Compare", "🧪 Ablation Study"])
+
+NO_DOCS_MSG = """
+**No documents loaded yet.** Upload files using the sidebar to get started.
+
+Supported: **PDF**, **DOCX**, **TXT**, **CSV**, **JSON**
+"""
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 1: Ask
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+with tab_ask:
+    if not has_docs:
+        st.warning(NO_DOCS_MSG)
+    else:
+        st.markdown("Choose a RAG variant and ask your question.")
+
+        variant = st.radio(
+            "RAG Variant",
+            ["Vanilla RAG", "RAG + MMR", "RAG + Hallucination Detection",
+             "RAG + Citation", "Full System"],
+            horizontal=True,
+            key="ask_variant",
+        )
+
+        query = st.text_input("Your question", placeholder="Type your question here...", key="ask_q")
+
+        if query:
+            config = apply_sidebar_config(ABLATION_VARIANTS[variant])
+
+            with st.spinner(f"Running {variant}..."):
+                try:
+                    pipeline = build_pipeline(config)
                     response = pipeline.query(query)
+                except Exception as e:
+                    st.error(f"Pipeline error: {e}")
+                    st.stop()
 
-                    results_table.append({
-                        "Variant": variant_name,
-                        "Query": query[:50],
-                        "Run": run + 1,
-                        "Avg Similarity": response.metrics.get("avg_similarity", 0),
-                        "Hallucination Rate": response.hallucination_stats.get("hallucination_rate", None),
-                        "Faithfulness": response.hallucination_stats.get("faithfulness_score", None),
-                        "Num Claims": response.hallucination_stats.get("num_claims", None),
-                        "Total Time (ms)": response.module_timings.get("total", 0),
-                        "Answer Length": len(response.final_answer),
-                    })
+            # ── Answer ──
+            st.markdown(f'<div class="answer-box">{response.final_answer}</div>',
+                        unsafe_allow_html=True)
 
-        progress.progress(1.0)
-        status.text("✅ Ablation study complete!")
+            # ── Metrics Row ──
+            cols = st.columns(4)
+            with cols[0]:
+                metric_card("Retrieval", f"{response.metrics.get('avg_similarity', 0):.4f}",
+                            "avg cosine sim")
+            with cols[1]:
+                metric_card("Total Time", f"{response.module_timings.get('total', 0):.0f}ms",
+                            "end-to-end")
+            with cols[2]:
+                hr = response.hallucination_stats.get("hallucination_rate")
+                metric_card("Halluc. Rate",
+                            f"{hr:.1%}" if hr is not None else "—",
+                            "lower is better" if hr is not None else "detection OFF")
+            with cols[3]:
+                cc = response.citation_stats.get("citation_coverage")
+                metric_card("Citation Cov.",
+                            f"{cc:.1%}" if cc is not None else "—",
+                            "higher is better" if cc is not None else "citation OFF")
 
-        # ── Results Table ──
-        st.markdown("---")
-        st.markdown("### 📊 Results")
+            # ── Hallucination Claims ──
+            if response.claims:
+                with st.expander("🔬 Claim-Level Analysis", expanded=True):
+                    show_claims(response.claims)
 
-        df = pd.DataFrame(results_table)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+            # ── Citations ──
+            if response.citations:
+                with st.expander("📎 Citations", expanded=True):
+                    show_citations(response.citations, response.get_active_docs())
 
-        # ── Summary Statistics ──
-        st.markdown("### 📈 Summary by Variant")
-        summary = df.groupby("Variant").agg({
-            "Avg Similarity": ["mean", "std"],
-            "Hallucination Rate": ["mean", "std"],
-            "Faithfulness": ["mean", "std"],
-            "Total Time (ms)": ["mean", "std"],
-            "Answer Length": ["mean"],
-        }).round(4)
-        st.dataframe(summary, use_container_width=True)
+            # ── Retrieved Documents ──
+            with st.expander("📄 Retrieved Documents"):
+                show_retrieved_docs(response.get_active_docs())
 
-        # ── Bar Chart ──
-        if "Hallucination Rate" in df.columns and df["Hallucination Rate"].notna().any():
-            st.markdown("### Hallucination Rate by Variant")
-            chart_data = df.groupby("Variant")["Hallucination Rate"].mean()
-            st.bar_chart(chart_data)
-
-        # ── Export ──
-        st.markdown("### 💾 Export Results")
-        col1, col2 = st.columns(2)
-        with col1:
-            csv_data = df.to_csv(index=False)
-            st.download_button(
-                "📥 Download CSV",
-                csv_data,
-                "ablation_results.csv",
-                "text/csv",
-                use_container_width=True,
-            )
-        with col2:
-            json_data = json.dumps(results_table, indent=2, default=str)
-            st.download_button(
-                "📥 Download JSON",
-                json_data,
-                "ablation_results.json",
-                "application/json",
-                use_container_width=True,
-            )
+            # ── Raw Metrics ──
+            with st.expander("📊 Full Metrics"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Module Timings:**")
+                    st.json(response.module_timings)
+                with col2:
+                    st.markdown("**All Metrics:**")
+                    st.json(response.metrics)
+                if response.hallucination_stats:
+                    st.markdown("**Hallucination Stats:**")
+                    st.json(response.hallucination_stats)
+                if response.citation_stats:
+                    st.markdown("**Citation Stats:**")
+                    st.json(response.citation_stats)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# MODE 4: Metrics Dashboard
+# TAB 2: Compare
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-elif mode == "Metrics Dashboard":
-    st.markdown("# 📊 Metrics Dashboard")
-    st.markdown("View accumulated metrics from all queries across sessions.")
+with tab_compare:
+    if not has_docs:
+        st.warning(NO_DOCS_MSG)
+    else:
+        st.markdown("Same question through **Vanilla RAG** vs **Full System** side-by-side.")
 
-    ml = st.session_state.metrics_logger
+        cmp_query = st.text_input("Your question", placeholder="Type your question here...",
+                                  key="cmp_q")
 
-    if not ml.logs:
-        st.info("No query logs yet. Run some queries first!")
-        st.stop()
+        ground_truth = st.text_area(
+            "Ground truth answer (optional — enables F1, ROUGE-L, Exact Match)",
+            placeholder="Paste the correct answer here if you have one...",
+            height=80, key="cmp_gt",
+        )
 
-    # ── Overview ──
-    st.markdown(f"**Total queries logged:** {len(ml.logs)}")
-    variants_seen = list(set(l.variant for l in ml.logs))
-    st.markdown(f"**Variants tested:** {', '.join(variants_seen)}")
+        if cmp_query:
+            gt = ground_truth.strip() if ground_truth.strip() else None
 
-    # ── Per-Variant Summary ──
-    st.markdown("---")
-    st.markdown("### Variant Comparison Table")
+            config_vanilla = RAGConfig(
+                use_mmr=False, use_citation=False, use_hallucination_detection=False,
+                **get_sidebar_config(),
+            )
+            config_full = RAGConfig(
+                use_mmr=True, use_citation=True, use_hallucination_detection=True,
+                **get_sidebar_config(),
+            )
 
-    comparison = ml.get_comparison_table()
-    if comparison:
-        comp_df = pd.DataFrame(comparison)
-        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+            col_left, col_right = st.columns(2)
 
-    # ── Timeline ──
-    st.markdown("### Query Timeline")
-    timeline_data = []
-    for log in ml.logs:
-        timeline_data.append({
-            "Query": log.query[:40],
-            "Variant": log.variant,
-            "Time (ms)": log.total_time_ms,
-            "Hallucination Rate": log.hallucination_metrics.get("hallucination_rate", None),
-        })
-    st.dataframe(pd.DataFrame(timeline_data), use_container_width=True, hide_index=True)
+            with col_left:
+                st.markdown("### 📦 Vanilla RAG")
+                with st.spinner("Running..."):
+                    pipe_v = build_pipeline(config_vanilla)
+                    resp_v = pipe_v.query(cmp_query, ground_truth=gt)
+                st.markdown(f'<div class="answer-box">{resp_v.final_answer}</div>',
+                            unsafe_allow_html=True)
+                c1, c2 = st.columns(2)
+                with c1:
+                    metric_card("Avg Similarity",
+                                f"{resp_v.metrics.get('avg_similarity', 0):.4f}")
+                with c2:
+                    metric_card("Time", f"{resp_v.module_timings.get('total', 0):.0f}ms")
 
-    # ── Export All ──
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("📥 Export All Logs (JSON)", use_container_width=True):
-            export_path = "/tmp/edu_rag_all_logs.json"
-            ml.export_to_json(export_path)
-            with open(export_path) as f:
-                st.download_button(
-                    "Download JSON",
-                    f.read(),
-                    "edu_rag_all_logs.json",
-                    "application/json",
-                )
-    with col2:
-        if st.button("📥 Export All Logs (CSV)", use_container_width=True):
-            export_path = "/tmp/edu_rag_all_logs.csv"
-            ml.export_to_csv(export_path)
-            with open(export_path) as f:
-                st.download_button(
-                    "Download CSV",
-                    f.read(),
-                    "edu_rag_all_logs.csv",
-                    "text/csv",
-                )
+            with col_right:
+                st.markdown("### 🛡️ Full System")
+                st.caption("MMR + Hallucination Detection + Citation")
+                with st.spinner("Running..."):
+                    pipe_f = build_pipeline(config_full)
+                    resp_f = pipe_f.query(cmp_query, ground_truth=gt)
+                st.markdown(f'<div class="answer-box">{resp_f.final_answer}</div>',
+                            unsafe_allow_html=True)
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    metric_card("Faithfulness",
+                                f"{resp_f.hallucination_stats.get('faithfulness_score', 0):.1%}")
+                with c2:
+                    metric_card("Halluc. Rate",
+                                f"{resp_f.hallucination_stats.get('hallucination_rate', 0):.1%}")
+                with c3:
+                    metric_card("Time", f"{resp_f.module_timings.get('total', 0):.0f}ms")
+
+                if resp_f.claims:
+                    with st.expander("🔬 Claims"):
+                        show_claims(resp_f.claims)
+                if resp_f.citations:
+                    with st.expander("📎 Citations"):
+                        show_citations(resp_f.citations, resp_f.get_active_docs())
+
+            # ── Answer Quality (if ground truth) ──
+            if gt:
+                st.markdown("---")
+                st.markdown("### 📊 Answer Quality Comparison")
+                ml = st.session_state.metrics_logger
+                aq_v = ml.compute_answer_quality(resp_v.final_answer, gt)
+                aq_f = ml.compute_answer_quality(resp_f.final_answer, gt)
+
+                comp_df = pd.DataFrame({
+                    "Metric": ["F1 Score", "Exact Match", "ROUGE-L"],
+                    "Vanilla RAG": [f"{aq_v.get('f1_score',0):.4f}",
+                                    f"{aq_v.get('exact_match',0):.0f}",
+                                    f"{aq_v.get('rouge_l',0):.4f}"],
+                    "Full System": [f"{aq_f.get('f1_score',0):.4f}",
+                                    f"{aq_f.get('exact_match',0):.0f}",
+                                    f"{aq_f.get('rouge_l',0):.4f}"],
+                })
+                st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 3: Ablation Study
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+with tab_ablation:
+    if not has_docs:
+        st.warning(NO_DOCS_MSG)
+    else:
+        st.markdown("Enter your questions, pick variants, and run the experiment.")
+
+        # ── Step 1: Questions ──
+        st.markdown("### Step 1: Enter your questions (one per line)")
+        questions_text = st.text_area(
+            "Questions",
+            placeholder="Type each question on a new line...",
+            height=150,
+            key="abl_questions",
+        )
+        questions = [q.strip() for q in questions_text.strip().split("\n") if q.strip()]
+
+        if questions:
+            st.success(f"📝 {len(questions)} question(s)")
+
+        # ── Step 2: Variants ──
+        st.markdown("### Step 2: Select variants to compare")
+        selected_variants = st.multiselect(
+            "Variants",
+            list(ABLATION_VARIANTS.keys()),
+            default=["Vanilla RAG", "Full System"],
+            key="abl_variants",
+        )
+
+        # ── Step 3: Run ──
+        st.markdown("### Step 3: Run")
+        num_runs = st.slider("Runs per question", 1, 5, 1, key="abl_runs")
+
+        ready = len(questions) > 0 and len(selected_variants) > 0
+
+        if not ready:
+            if not questions:
+                st.info("☝️ Enter at least one question above.")
+            if not selected_variants:
+                st.info("☝️ Select at least one variant.")
+
+        if st.button("🚀 Run Ablation Study", type="primary", disabled=not ready,
+                     use_container_width=True):
+
+            st.session_state.metrics_logger = MetricsLogger("ablation")
+
+            total_steps = len(selected_variants) * len(questions) * num_runs
+            progress = st.progress(0)
+            status = st.empty()
+            step = 0
+            results = []
+
+            for variant_name in selected_variants:
+                config = apply_sidebar_config(ABLATION_VARIANTS[variant_name])
+                pipeline = build_pipeline(config)
+
+                for q in questions:
+                    for run in range(num_runs):
+                        step += 1
+                        progress.progress(step / total_steps)
+                        status.text(f"{variant_name} | {q[:50]}... | Run {run+1}/{num_runs}")
+
+                        try:
+                            resp = pipeline.query(q)
+                        except Exception as e:
+                            logger.error(f"Query failed: {e}")
+                            continue
+
+                        row = {
+                            "Variant": variant_name,
+                            "Question": q,
+                            "Run": run + 1,
+                            "Avg Similarity": round(resp.metrics.get("avg_similarity", 0), 4),
+                            "Total Time (ms)": round(resp.module_timings.get("total", 0), 1),
+                            "Answer Length": len(resp.final_answer),
+                        }
+
+                        if resp.hallucination_stats:
+                            row["Halluc. Rate"] = round(
+                                resp.hallucination_stats.get("hallucination_rate", 0), 4)
+                            row["Faithfulness"] = round(
+                                resp.hallucination_stats.get("faithfulness_score", 0), 4)
+                            row["Claims"] = int(
+                                resp.hallucination_stats.get("num_claims", 0))
+                            row["Supported"] = int(
+                                resp.hallucination_stats.get("num_supported", 0))
+                        else:
+                            row["Halluc. Rate"] = None
+                            row["Faithfulness"] = None
+                            row["Claims"] = None
+                            row["Supported"] = None
+
+                        if resp.citation_stats:
+                            row["Cit. Coverage"] = round(
+                                resp.citation_stats.get("citation_coverage", 0), 4)
+                            row["Cit. Confidence"] = round(
+                                resp.citation_stats.get("avg_confidence", 0), 4)
+                        else:
+                            row["Cit. Coverage"] = None
+                            row["Cit. Confidence"] = None
+
+                        row["MMR Active"] = resp.mmr_reranked_docs is not None
+                        results.append(row)
+
+            progress.progress(1.0)
+            status.text("✅ Done!")
+
+            if not results:
+                st.error("No results generated. Check your LLM settings.")
+            else:
+                st.markdown("---")
+                df = pd.DataFrame(results)
+
+                # ── Summary ──
+                st.markdown("### 📊 Summary by Variant")
+                num_cols = ["Avg Similarity", "Total Time (ms)", "Answer Length",
+                            "Halluc. Rate", "Faithfulness", "Cit. Coverage"]
+                existing = [c for c in num_cols if c in df.columns]
+                summary = df.groupby("Variant")[existing].agg(["mean", "std"]).round(4)
+                st.dataframe(summary, use_container_width=True)
+
+                # ── Charts ──
+                hr_data = df.dropna(subset=["Halluc. Rate"])
+                if not hr_data.empty:
+                    st.markdown("### Hallucination Rate by Variant")
+                    st.bar_chart(hr_data.groupby("Variant")["Halluc. Rate"].mean())
+
+                f_data = df.dropna(subset=["Faithfulness"])
+                if not f_data.empty:
+                    st.markdown("### Faithfulness Score by Variant")
+                    st.bar_chart(f_data.groupby("Variant")["Faithfulness"].mean())
+
+                # ── Full Table ──
+                st.markdown("### Full Results")
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                # ── Export ──
+                st.markdown("### 💾 Export")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button("📥 CSV", df.to_csv(index=False),
+                                       "ablation_results.csv", "text/csv",
+                                       use_container_width=True)
+                with col2:
+                    st.download_button("📥 JSON",
+                                       json.dumps(results, indent=2, default=str),
+                                       "ablation_results.json", "application/json",
+                                       use_container_width=True)
