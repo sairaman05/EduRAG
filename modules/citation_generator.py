@@ -93,11 +93,25 @@ class CitationGenerator(BaseCitationGenerator):
                         scores = cosine_scores[i]
                         cited_doc_ids = []
                         best_score = 0.0
-                        for j, score in enumerate(scores):
-                            s = score.item()
-                            if s >= self.config.citation_min_similarity:
+                        
+                        # Clean sentence for robust substring check
+                        clean_sentence = sentence.replace("[Extractive Answer]", "").strip()
+                        clean_sentence = re.sub(r'\[Source \d+:.*?\] \(relevance: [0-9.]+\)', '', clean_sentence).strip()
+                        clean_sentence = clean_sentence.replace("...", "").strip()
+                        
+                        # 3a. Exact Substring Match (especially for extractive fallback)
+                        for j, doc in enumerate(valid_docs):
+                            if clean_sentence and len(clean_sentence) > 20 and clean_sentence in doc.document.content:
                                 cited_doc_ids.append(valid_docs[j].document.doc_id)
-                                best_score = max(best_score, s)
+                                best_score = max(best_score, 1.0)
+                        
+                        # 3b. Dense Similarity Match (if exact match fails)
+                        if not cited_doc_ids:
+                            for j, score in enumerate(scores):
+                                s = score.item()
+                                if s >= self.config.citation_min_similarity:
+                                    cited_doc_ids.append(valid_docs[j].document.doc_id)
+                                    best_score = max(best_score, s)
                                 
                         if cited_doc_ids:
                             cite_tags = "".join([f"[{doc_id}]" for doc_id in cited_doc_ids])
