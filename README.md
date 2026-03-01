@@ -535,9 +535,7 @@ Accumulated view across all queries run in the session:
 
 ---
 
-## 9. Teammate Integration Guide
-
-### 🔌 For the MMR Teammate
+### 🔌 For the MMR
 
 **What to do:** Create the file `modules/mmr_reranker.py`
 
@@ -603,7 +601,7 @@ class MMRReranker(BaseReranker):
 
 ---
 
-### 🔌 For the Citation Teammate
+### 🔌 For the Citation
 
 **What to do:** Create the file `modules/citation_generator.py`
 
