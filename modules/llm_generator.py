@@ -3,7 +3,7 @@
  Module 5: LLM Answer Generation
 ═══════════════════════════════════════════════════════════════════════════════
  Responsible for generating answers from retrieved context.
- Supports multiple LLM backends: Ollama (local), OpenAI API, HuggingFace.
+ Supports multiple LLM backends: Ollama (local), OpenAI API.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -19,14 +19,15 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You are a helpful educational assistant. Answer the question based ONLY on the provided context. 
 If the context does not contain enough information to answer, say so clearly.
 Be factual, precise, and cite specific details from the context.
-Do not make up information beyond what is provided."""
+Do not make up information beyond what is provided.
+Provide a complete, thorough answer. Do not cut off mid-sentence."""
 
 CONTEXT_TEMPLATE = """Context:
 {context}
 
 Question: {question}
 
-Answer based only on the above context:"""
+Answer based only on the above context. Provide a complete and detailed response:"""
 
 
 class LLMGenerator:
@@ -77,10 +78,8 @@ class LLMGenerator:
             answer = self._generate_ollama(sys_prompt, prompt)
         elif self.config.llm_provider == "openai":
             answer = self._generate_openai(sys_prompt, prompt)
-        elif self.config.llm_provider == "huggingface":
-            answer = self._generate_huggingface(sys_prompt, prompt)
         else:
-            raise ValueError(f"Unknown LLM provider: {self.config.llm_provider}")
+            raise ValueError(f"Unknown LLM provider: {self.config.llm_provider}. Use 'ollama' or 'openai'.")
 
         gen_time = time.time() - t_start
         self._last_metrics = {
@@ -110,7 +109,7 @@ class LLMGenerator:
                     },
                     "stream": False,
                 },
-                timeout=120,
+                timeout=180,
             )
             response.raise_for_status()
             return response.json().get("response", "").strip()
@@ -164,7 +163,7 @@ class LLMGenerator:
         if "Context:" in prompt and "Question:" in prompt:
             context = prompt.split("Context:")[1].split("Question:")[0].strip()
             # Take first 500 chars of context as a crude answer
-            return f"[Extractive Answer] {context[:500]}..."
+            return f"[Extractive Answer] {context[:1500]}..."
         return "[No LLM available for generation. Please configure an LLM backend.]"
 
     def get_metrics(self) -> Dict[str, float]:

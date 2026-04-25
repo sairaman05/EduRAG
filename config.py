@@ -14,21 +14,11 @@ import time
 import uuid
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# System Configuration (Ablation Flags)
-# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class RAGConfig:
     """
     Master configuration for ablation experiments.
     Each flag toggles a module ON/OFF independently.
-
-    Ablation Variants:
-        Vanilla RAG:           use_mmr=False, use_citation=False, use_hallucination_detection=False
-        RAG + MMR:             use_mmr=True,  use_citation=False, use_hallucination_detection=False
-        RAG + Citation:        use_mmr=False, use_citation=True,  use_hallucination_detection=False
-        RAG + Hallucination:   use_mmr=False, use_citation=False, use_hallucination_detection=True
-        Full System:           use_mmr=True,  use_citation=True,  use_hallucination_detection=True
     """
     # ── Module Toggles ──
     use_mmr: bool = False
@@ -37,33 +27,32 @@ class RAGConfig:
 
     # ── Retrieval Settings ──
     top_k: int = 5
-    embedding_dim: int = 384  # default for all-MiniLM-L6-v2
-    similarity_metric: str = "cosine"  # "cosine" | "dot" | "euclidean"
+    embedding_dim: int = 384
+    similarity_metric: str = "cosine"
 
-    # ── MMR Settings (teammate's module) ──
-    mmr_lambda: float = 0.7  # trade-off between relevance and diversity
+    # ── MMR Settings ──
+    mmr_lambda: float = 0.7
     mmr_top_n: int = 5
 
     # ── Hallucination Detection Settings ──
-    hallucination_threshold: float = 0.5  # claims below this are flagged
+    hallucination_threshold: float = 0.5
     nli_model_name: str = "cross-encoder/nli-deberta-v3-small"
-    claim_extraction_method: str = "sentence"  # "sentence" | "clause"
+    claim_extraction_method: str = "sentence"
 
-    # ── Citation Settings (teammate's module) ──
+    # ── Citation Settings ──
     citation_min_similarity: float = 0.6
 
     # ── LLM Settings ──
-    llm_model: str = "llama3"  # or any Ollama / API model
+    llm_model: str = "llama3"
     llm_temperature: float = 0.3
-    llm_max_tokens: int = 512
-    llm_provider: str = "ollama"  # "ollama" | "openai" | "huggingface"
+    llm_max_tokens: int = 1024
+    llm_provider: str = "ollama"
 
     # ── Evaluation ──
     log_metrics: bool = True
     random_seed: int = 42
 
     def get_variant_name(self) -> str:
-        """Return human-readable ablation variant name."""
         flags = []
         if self.use_mmr:
             flags.append("MMR")
@@ -78,16 +67,12 @@ class RAGConfig:
         return "RAG+" + "+".join(flags)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared Data Types
-# ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class Document:
-    """A single document/chunk in the knowledge base."""
     doc_id: str
     content: str
     metadata: Dict[str, Any] = field(default_factory=dict)
-    embedding: Optional[List[float]] = None  # populated by embedding module
+    embedding: Optional[List[float]] = None
 
     def __post_init__(self):
         if not self.doc_id:
@@ -96,30 +81,22 @@ class Document:
 
 @dataclass
 class RetrievedDocument:
-    """A document returned by retrieval with relevance score."""
     document: Document
-    score: float  # similarity score [0, 1]
+    score: float
     rank: int
-
-    # ── Extended by MMR module (teammate fills these) ──
     mmr_score: Optional[float] = None
     diversity_contribution: Optional[float] = None
-
-    # ── Extended by Citation module (teammate fills these) ──
-    citation_spans: Optional[List[Dict]] = None  # [{start, end, text}]
+    citation_spans: Optional[List[Dict]] = None
     citation_id: Optional[str] = None
 
 
 @dataclass
 class Claim:
-    """A single atomic claim extracted from the LLM answer."""
     claim_id: str
     text: str
-    source_sentence: str  # original sentence it was extracted from
-
-    # ── Hallucination detection results ──
+    source_sentence: str
     is_supported: Optional[bool] = None
-    support_score: Optional[float] = None  # NLI entailment probability
+    support_score: Optional[float] = None
     supporting_doc_ids: List[str] = field(default_factory=list)
     evidence_text: Optional[str] = None
 
@@ -137,23 +114,31 @@ class RAGResponse:
     # ── Dense Retrieval output ──
     retrieved_docs: List[RetrievedDocument] = field(default_factory=list)
 
-    # ── MMR output (teammate) ──
+    # ── MMR output ──
     mmr_reranked_docs: Optional[List[RetrievedDocument]] = None
 
     # ── LLM Generation output ──
     raw_answer: str = ""
-    final_answer: str = ""  # post-processed (after hallucination filtering)
+    final_answer: str = ""
 
-    # ── Hallucination Detection output ──
+    # ── Hallucination Detection output (only when module is active) ──
     claims: List[Claim] = field(default_factory=list)
     hallucination_flags: Dict[str, bool] = field(default_factory=dict)
     hallucination_stats: Dict[str, float] = field(default_factory=dict)
 
-    # ── Citation output (teammate) ──
+    # ── Citation output (only when module is active) ──
     citations: List[Dict] = field(default_factory=list)
     citation_stats: Dict[str, float] = field(default_factory=dict)
 
-    # ── Evaluation Metrics (logged per query) ──
+    # ═══════════════════════════════════════════════════════════════════════
+    # Evaluation-Only Metrics — ALWAYS computed for uniform comparison
+    # These do NOT modify the answer; they are read-only scoring passes
+    # ═══════════════════════════════════════════════════════════════════════
+    eval_claims: List[Claim] = field(default_factory=list)
+    eval_hallucination_stats: Dict[str, float] = field(default_factory=dict)
+    eval_citation_stats: Dict[str, float] = field(default_factory=dict)
+
+    # ── Combined metrics ──
     metrics: Dict[str, float] = field(default_factory=dict)
 
     # ── Pipeline Metadata ──
@@ -161,15 +146,38 @@ class RAGResponse:
     module_timings: Dict[str, float] = field(default_factory=dict)
 
     def get_active_docs(self) -> List[RetrievedDocument]:
-        """Return MMR-reranked docs if available, else dense retrieval docs."""
         if self.mmr_reranked_docs is not None:
             return self.mmr_reranked_docs
         return self.retrieved_docs
 
+    def get_effective_hallucination_stats(self) -> Dict[str, float]:
+        """
+        Return hallucination stats from active module if it ran,
+        otherwise from the evaluation-only pass. Always returns stats.
+        """
+        if self.hallucination_stats:
+            return self.hallucination_stats
+        return self.eval_hallucination_stats
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Predefined Ablation Variants
-# ─────────────────────────────────────────────────────────────────────────────
+    def get_effective_citation_stats(self) -> Dict[str, float]:
+        """
+        Return citation stats from active module if it ran,
+        otherwise from the evaluation-only pass. Always returns stats.
+        """
+        if self.citation_stats:
+            return self.citation_stats
+        return self.eval_citation_stats
+
+    def get_effective_claims(self) -> List:
+        """
+        Return claims from active module if it ran,
+        otherwise from the evaluation-only pass.
+        """
+        if self.claims:
+            return self.claims
+        return self.eval_claims
+
+
 ABLATION_VARIANTS = {
     "Vanilla RAG": RAGConfig(
         use_mmr=False, use_citation=False, use_hallucination_detection=False
